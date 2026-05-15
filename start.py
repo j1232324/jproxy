@@ -3,9 +3,9 @@
 jproxy — 启动向导
 
 首次运行时的交互式初始化工具：
-  1. 填写上游 API Key 和地址
+  1. 填写上游 API Key 和地址（自动获取可用模型）
   2. 设置代理的 API Key
-  3. 选择要聚合的模型
+  3. 选择要用的模型
   4. 保存配置并启动服务
 
 用法:
@@ -25,49 +25,17 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(SCRIPT_DIR, "config.yaml")
 PROXY_PATH = os.path.join(SCRIPT_DIR, "proxy.py")
 
-# ─── 推荐模型库（示例，用户可自定义） ─────────────────────
+# ─── 默认推荐模型（上游获取失败时的备选） ────────────────
 
-RECOMMENDED_MODELS = [
-    {
-        "name": "Qwen/Qwen2.5-72B-Instruct",
-        "default_priority": 1,
-        "desc": "通义千问 72B — 最强，适合复杂任务",
-    },
-    {
-        "name": "Qwen/Qwen2.5-32B-Instruct",
-        "default_priority": 2,
-        "desc": "通义千问 32B — 性价比之选",
-    },
-    {
-        "name": "Qwen/Qwen2.5-14B-Instruct",
-        "default_priority": 3,
-        "desc": "通义千问 14B — 轻量快速",
-    },
-    {
-        "name": "Qwen/Qwen2.5-7B-Instruct",
-        "default_priority": 4,
-        "desc": "通义千问 7B — 极速响应",
-    },
-    {
-        "name": "Qwen/Qwen2.5-Coder-32B-Instruct",
-        "default_priority": 5,
-        "desc": "代码专用 32B",
-    },
-    {
-        "name": "Qwen/QwQ-32B-Preview",
-        "default_priority": 6,
-        "desc": "推理模型 32B",
-    },
-    {
-        "name": "deepseek-ai/DeepSeek-R1-Distill-Qwen-32B",
-        "default_priority": 7,
-        "desc": "DeepSeek R1 蒸馏版 32B",
-    },
-    {
-        "name": "ZhipuAI/glm-4-9b-chat",
-        "default_priority": 8,
-        "desc": "智谱 GLM-4 9B",
-    },
+FALLBACK_MODELS = [
+    {"name": "Qwen/Qwen2.5-72B-Instruct", "desc": "通义千问 72B"},
+    {"name": "Qwen/Qwen2.5-32B-Instruct", "desc": "通义千问 32B"},
+    {"name": "Qwen/Qwen2.5-14B-Instruct", "desc": "通义千问 14B"},
+    {"name": "Qwen/Qwen2.5-7B-Instruct", "desc": "通义千问 7B"},
+    {"name": "Qwen/Qwen2.5-Coder-32B-Instruct", "desc": "代码专用 32B"},
+    {"name": "Qwen/QwQ-32B-Preview", "desc": "推理模型 32B"},
+    {"name": "deepseek-ai/DeepSeek-R1-Distill-Qwen-32B", "desc": "DeepSeek R1 蒸馏版"},
+    {"name": "ZhipuAI/glm-4-9b-chat", "desc": "智谱 GLM-4 9B"},
 ]
 
 # ─── 工具函数 ─────────────────────────────────────────────
@@ -127,6 +95,35 @@ def is_configured(config: dict) -> bool:
     return bool(key and models)
 
 
+# ─── 获取上游模型列表 ─────────────────────────────────────
+
+
+def try_fetch_models(base_url: str, api_key: str) -> list | None:
+    """尝试从上游 API 获取可用模型列表。
+
+    调用 GET /v1/models，返回模型名列表。
+    失败时返回 None。
+    """
+    import urllib.request
+    import json
+
+    url = base_url.rstrip("/") + "/models"
+    req = urllib.request.Request(url)
+    req.add_header("Authorization", f"Bearer {api_key}")
+    req.add_header("Content-Type", "application/json")
+
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read())
+            models = data.get("data", [])
+            names = [m["id"] for m in models if isinstance(m, dict) and "id" in m]
+            if names:
+                return names
+    except Exception:
+        pass
+    return None
+
+
 # ─── 向导步骤 ─────────────────────────────────────────────
 
 
@@ -136,15 +133,15 @@ def step_welcome():
     print("遇到频率限制时自动降级到下一个可用模型。")
     print()
     print("配置三样东西就可以开始：")
-    print("  ① 上游 API 地址和 Key")
+    print("  ① 上游 API 地址和 Key（自动拉取模型列表）")
     print("  ② 代理的密码（你的客户端用）")
-    print("  ③ 要用的模型列表")
+    print("  ③ 选择要用的模型")
     print()
 
 
 def step_upstream(config: dict) -> tuple:
-    """步骤 1: 配置上游 API 地址和 Key。"""
-    print_step(1, 4, "配置上游 API")
+    """步骤 1: 配置上游 API + 自动获取模型列表。"""
+    print_step(1, 4, "配置上游 API（自动获取可用模型）")
 
     current_cfg = config.get("upstream", {})
     default_url = current_cfg.get("base_url", "https://api.openai.com/v1")
@@ -155,7 +152,7 @@ def step_upstream(config: dict) -> tuple:
         print(f"  当前 Key: {color(masked, 'dim')}")
         change = input("  是否更换？(y/N): ").strip().lower()
         if change != "y" and change != "yes":
-            return default_url, default_key
+            return default_url, default_key, None
 
     print()
     url = input_with_default("  上游 API 地址", default_url)
@@ -166,7 +163,16 @@ def step_upstream(config: dict) -> tuple:
             break
         print(color("  ✗ 不能为空", "red"))
 
-    return url, key
+    # 尝试自动获取模型列表
+    print(f"  {color('⟳ 正在拉取可用模型列表...', 'dim')}", end="")
+    fetched = try_fetch_models(url, key)
+    if fetched:
+        print(color(" ✓", "green"))
+        print(f"    获取到 {len(fetched)} 个模型")
+    else:
+        print(color(" 无法获取（将使用推荐列表）", "yellow"))
+
+    return url, key, fetched
 
 
 def step_proxy_key(config: dict) -> str:
@@ -183,9 +189,9 @@ def step_proxy_key(config: dict) -> str:
     return key
 
 
-def step_models(config: dict) -> list:
-    """步骤 3: 添加模型（优先级自动排列）。"""
-    print_step(3, 4, "添加模型")
+def step_models(config: dict, fetched_models: list | None) -> list:
+    """步骤 3: 选择模型（优先级自动排列）。"""
+    print_step(3, 4, "选择模型")
 
     existing = config.get("models", [])
     if existing:
@@ -196,34 +202,62 @@ def step_models(config: dict) -> list:
         if modify != "y":
             return existing
 
+    # 构建候选列表：API 获取的 + 备选推荐
+    candidates = []
+    seen = set()
+
+    if fetched_models:
+        for name in fetched_models:
+            if name not in seen:
+                candidates.append({"name": name, "desc": ""})
+                seen.add(name)
+
+    for m in FALLBACK_MODELS:
+        if m["name"] not in seen:
+            candidates.append(m)
+            seen.add(m["name"])
+
     models = []
     print()
     print("  按添加顺序自动分配优先级（1, 2, 3...）")
+    print(f"  输入序号选择模型，或直接输入 {color('模型名', 'cyan')} 自定义")
     print(f"  {color('直接回车', 'bold')}完成添加")
     print()
 
-    print(f"  {color('推荐模型（输入序号添加）:', 'bold')}")
-    for i, m in enumerate(RECOMMENDED_MODELS, 1):
-        print(f"    {i:2d}. {color(m['name'], 'cyan')}")
-        print(f"        {m['desc']}")
+    # 显示候选列表（最多 30 个）
+    MAX_SHOW = 30
+    print(f"  {color('可用模型:', 'bold')}")
+    for i, m in enumerate(candidates[:MAX_SHOW], 1):
+        rest = ""
+        if i == 1 and fetched_models:
+            rest = " (来自上游 API)"
+        name_display = m["name"]
+        if len(name_display) > 60:
+            name_display = name_display[:57] + "..."
+        print(f"    {i:2d}. {color(name_display, 'cyan')}{color(rest, 'dim')}")
+    if len(candidates) > MAX_SHOW:
+        print(f"    ... 还有 {len(candidates) - MAX_SHOW} 个（可直接输入模型名添加）")
     print()
 
     while True:
         inp = input("  > ").strip()
+
         if not inp:
             if not models:
                 print(color("  ✗ 至少需要添加一个模型", "red"))
                 continue
             break
 
+        # 序号选择
         if inp.isdigit():
             idx = int(inp) - 1
-            if 0 <= idx < len(RECOMMENDED_MODELS):
-                name = RECOMMENDED_MODELS[idx]["name"]
+            if 0 <= idx < len(candidates):
+                name = candidates[idx]["name"]
             else:
-                print(color(f"  ✗ 序号无效，请输入 1-{len(RECOMMENDED_MODELS)}", "red"))
+                print(color(f"  ✗ 序号无效，范围 1-{len(candidates)}", "red"))
                 continue
         else:
+            # 自定义模型名
             name = inp
 
         if not name:
@@ -237,7 +271,7 @@ def step_models(config: dict) -> list:
         print(color(f"    ✓ #{priority}  {name}", "green"))
 
     print()
-    print(f"  已添加 {len(models)} 个模型:")
+    print(f"  已选择 {len(models)} 个模型:")
     for i, m in enumerate(models, 1):
         print(f"    #{i}  {m['name']}")
 
@@ -250,7 +284,6 @@ def step_summary(config: dict, upstream_url: str, upstream_key: str, proxy_key: 
 
     print()
     print(f"  {color('上游地址:', 'bold')}    {upstream_url}")
-    print(f"  {color('上游 Key:', 'bold')}    {color(upstream_key[:10] + '...', 'dim')}")
     print(f"  {color('代理密码:', 'bold')}     {proxy_key}")
     print(f"  {color('模型数量:', 'bold')}     {len(models)} 个")
     print()
@@ -302,12 +335,10 @@ def main():
             os.rename(CONFIG_PATH, bak)
             print(f"  旧配置已备份: {bak}")
         config = {}
-        sf = os.path.join(SCRIPT_DIR, ".model_quota_state.json")
-        if os.path.exists(sf):
-            os.remove(sf)
-        rf = os.path.join(SCRIPT_DIR, ".model_review")
-        if os.path.exists(rf):
-            os.remove(rf)
+        for f in [".model_quota_state.json", ".model_review"]:
+            p = os.path.join(SCRIPT_DIR, f)
+            if os.path.exists(p):
+                os.remove(p)
 
     if args.quick and is_configured(config):
         print(color("  ✓ 配置就绪，启动...", "green"))
@@ -323,10 +354,11 @@ def main():
                 _start_proxy()
             return
 
+    # ── 完整向导 ──
     step_welcome()
-    url, key = step_upstream(config)
+    url, key, fetched = step_upstream(config)
     proxy_key = step_proxy_key(config)
-    models = step_models(config)
+    models = step_models(config, fetched)
     should_start = step_summary(config, url, key, proxy_key, models)
 
     if should_start:
