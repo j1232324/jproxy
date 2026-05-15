@@ -98,7 +98,7 @@ def is_configured(config: dict) -> bool:
 # ─── 获取上游模型列表 ─────────────────────────────────────
 
 
-def try_fetch_models(base_url: str, api_key: str) -> list | None:
+def try_fetch_models(base_url: str, api_key: str):
     """尝试从上游 API 获取可用模型列表。
 
     调用 GET /v1/models，返回模型名列表。
