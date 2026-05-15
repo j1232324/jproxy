@@ -189,7 +189,7 @@ def step_proxy_key(config: dict) -> str:
     return key
 
 
-def step_models(config: dict, fetched_models: list | None) -> list:
+def step_models(config: dict, fetched_models: list) -> list:
     """步骤 3: 选择模型（优先级自动排列）。"""
     print_step(3, 4, "选择模型")
 
