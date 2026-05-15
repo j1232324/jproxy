@@ -37,7 +37,7 @@ class ModelManager:
 
         # 每个模型的每日限额不一定相同，也不一定知道具体值。
         # daily_limit 留空 = 不限（靠 429 响应自动判断）
-        # 建议用户按实际 ModelScope 额度配置
+        # 建议用户按实际上游额度配置
         for m in self.models:
             m.setdefault("daily_limit", 0)
 

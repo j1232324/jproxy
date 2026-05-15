@@ -1,42 +1,22 @@
 # ============================================================
-# ModelScope Proxy 配置文件
+# jproxy 配置文件
 # ============================================================
 
 proxy:
-  # 监听地址
   host: "0.0.0.0"
   port: 8000
-
-  # 客户端调用时需要提供的 API Key（相当于代理的密码）
-  # 用户在请求时使用这个 key，而非 ModelScope 的 token
   api_key: "sk-your-proxy-key"
 
-modelscope:
-  # 你的 ModelScope API Token
-  # 获取地址: https://modelscope.cn/my/myAccessKey
-  api_token: "test-token-for-validation"
-
-  # ModelScope API 地址（一般不需要改）
+upstream:
+  # 上游 API 地址（OpenAI 兼容格式）
+  # 例如: https://api-inference.modelscope.cn
   base_url: "https://api-inference.modelscope.cn"
 
+  # 上游 API Key
+  api_key: ""
+
 # 模型列表 — 按优先级排序，数值越小优先级越高
-# 最高优先级的模型先用，配额耗尽后自动切换到下一个
-#
-# 常用免费模型推荐:
-#   - Qwen/Qwen2.5-72B-Instruct
-#   - Qwen/Qwen2.5-32B-Instruct
-#   - Qwen/Qwen2.5-14B-Instruct
-#   - Qwen/Qwen2.5-7B-Instruct
-#   - Qwen/Qwen2.5-Coder-32B-Instruct
-#   - Qwen/QwQ-32B-Preview
-#   - deepseek-ai/DeepSeek-R1-Distill-Qwen-32B
-#   - ZhipuAI/glm-4-9b-chat
-#   - iic/LLaVA-Llama-3-8B
-#
-# 每个模型的每日限额不同，有的几百次，有的一两千次
-# 留空 = 不限（靠 ModelScope 返回的 429 自动判断配额耗尽）
-# 如果明确知道限额，可设 daily_limit 来主动控制
-# 每个模型按实际限额配置，不设则用满为止（靠 429 自动判断）
+# 最高优先级的先用，遇到 429 自动降级到下一个
 models:
   - name: "Qwen/Qwen2.5-72B-Instruct"
     priority: 1
@@ -44,10 +24,5 @@ models:
     priority: 2
 
 settings:
-  # 遇到 429 配额耗尽时，最多连续尝试几个模型
-  # 例如 3 表示：首选 → 降级1 → 降级2 → 降级3，共尝试 4 个
   max_retries: 3
-
-  # 模型列表审查提醒间隔（天）
-  # 到期后启动服务时会提示运行 --review-models
   model_review_interval_days: 30

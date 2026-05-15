@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-ModelScope Proxy — OpenAI 兼容的 API 代理，自动切换 ModelScope 后台模型。
+jproxy — 通用 API 代理，自动切换上游模型
 
 核心功能:
   1. 提供一个固定的 API 地址和 Key，用户零感知
@@ -50,17 +50,17 @@ def load_config(path: str) -> dict:
         print(f"    正在创建默认配置文件 ...")
         _create_default_config(abs_path)
         print(f"    ✓ 已创建: {abs_path}")
-        print(f"    [!] 请编辑该文件，填入你的 ModelScope Token 和模型列表后重新启动。")
+        print(f"    [!] 请编辑该文件，填入你的 上游 API Key 和模型列表后重新启动。")
         sys.exit(1)
 
     with open(abs_path, "r") as f:
         config = yaml.safe_load(f)
 
     # 校验必填项
-    token = config.get("modelscope", {}).get("api_token", "")
+    token = config.get("upstream", {}).get("api_key", "")
     if not token:
-        print("[!] modelscope.api_token 未设置！")
-        print("    请到 https://modelscope.cn/my/myAccessKey 获取你的 API Token")
+        print("[!] upstream.api_key 未设置！")
+        print("    请到上游服务商网站获取你的 API Key")
         print("    然后编辑 config.yaml 填入。")
         sys.exit(1)
 
@@ -88,9 +88,9 @@ def _create_default_config(path: str):
             "port": 8000,
             "api_key": "sk-your-proxy-key",
         },
-        "modelscope": {
-            "api_token": "",
-            "base_url": "https://api-inference.modelscope.cn",
+        "upstream": {
+            "api_key": "",
+            "base_url": "https://api.openai.com/v1",
         },
         "models": [],
         "settings": {
@@ -201,9 +201,9 @@ def review_models_interactive(config_path: str):
 
 def create_app(config: dict) -> FastAPI:
     """创建 FastAPI 应用实例。"""
-    app = FastAPI(title="ModelScope Proxy", version="1.0.0")
+    app = FastAPI(title="jproxy", version="1.0.0")
     manager = ModelManager(config)
-    modelscope_cfg = config["modelscope"]
+    upstream_cfg = config["upstream"]
     proxy_cfg = config["proxy"]
     settings = config["settings"]
 
@@ -250,7 +250,7 @@ def create_app(config: dict) -> FastAPI:
                 "id": s["name"],
                 "object": "model",
                 "created": 0,
-                "owned_by": "modelscope",
+                "owned_by": "upstream",
                 "available": s["available"],
                 "daily_usage": {
                     "used": s["used_today"],
@@ -283,7 +283,7 @@ def create_app(config: dict) -> FastAPI:
             ms_request = translate_request(body, model_name)
 
             headers = {
-                "Authorization": f"Bearer {modelscope_cfg['api_token']}",
+                "Authorization": f"Bearer {upstream_cfg['api_key']}",
                 "Content-Type": "application/json",
                 "Accept": "application/json",
             }
@@ -292,13 +292,13 @@ def create_app(config: dict) -> FastAPI:
                 # 流式响应 — 交给独立的处理函数
                 return await _handle_streaming(
                     ms_request, headers, model_name,
-                    modelscope_cfg["base_url"], manager,
+                    upstream_cfg["base_url"], manager,
                 )
             else:
                 # 非流式响应
                 result = await _handle_non_streaming(
                     ms_request, headers, model_name,
-                    modelscope_cfg["base_url"], manager,
+                    upstream_cfg["base_url"], manager,
                 )
                 if result is not None:
                     return result
@@ -359,14 +359,14 @@ async def _handle_non_streaming(
         except httpx.TimeoutException:
             return JSONResponse(
                 status_code=504,
-                content={"error": {"message": "ModelScope API 超时", "code": "timeout"}},
+                content={"error": {"message": "上游API超时", "code": "timeout"}},
             )
         except httpx.RequestError as e:
             return JSONResponse(
                 status_code=502,
                 content={
                     "error": {
-                        "message": f"连接 ModelScope 失败: {str(e)}",
+                        "message": f"连接上游失败: {str(e)}",
                         "code": "connection_error",
                     }
                 },
@@ -418,7 +418,7 @@ async def _handle_streaming(
                         if response.status_code != 200:
                             error_text = await response.aread()
                             yield _sse_error(
-                                f"ModelScope 返回 HTTP {response.status_code}"
+                                f"上游返回HTTP {response.status_code}"
                             )
                             yield "data: [DONE]\n\n"
                             return
@@ -488,7 +488,7 @@ def _sse_error(message: str) -> bytes:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="ModelScope Proxy — 多模型自动切换代理",
+        description="jproxy — 多模型自动切换代理",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 示例:
@@ -560,7 +560,7 @@ def main():
         print("┌─────────────────────────────────────────────────────────────┐")
         print("│  📋 模型列表审查提醒                                        │")
         print(f"│  上次审查距今已超过 {interval} 天                            │")
-        print("│  ModelScope 不断有新模型上线，建议定期更新。                 │")
+        print("│  上游 不断有新模型上线，建议定期更新。                 │")
         print("│                                                             │")
         print("│  运行以下命令审查:                                            │")
         print(f"│    python3 proxy.py --review-models                         │")
@@ -573,7 +573,7 @@ def main():
     port = config["proxy"]["port"]
     api_key = config["proxy"]["api_key"]
 
-    print(f"🚀 ModelScope Proxy 已启动")
+    print(f"🚀 jproxy 已启动")
     print(f"   📡 监听: http://{host}:{port}")
     print(f"   🔑 代理 Key: {api_key}")
     print(f"   📊 已配置 {len(config.get('models', []))} 个模型")
