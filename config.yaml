@@ -9,8 +9,8 @@ proxy:
 
 upstream:
   # 上游 API 地址（OpenAI 兼容格式）
-  # 例如: https://api-inference.modelscope.cn
-  base_url: "https://api-inference.modelscope.cn"
+  # 例如: https://api.openai.com/v1
+  base_url: "https://api.openai.com/v1"
 
   # 上游 API Key
   api_key: ""
