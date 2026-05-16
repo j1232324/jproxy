@@ -498,20 +498,62 @@ def _anthropic_to_openai(anthropic_body: dict, model_name: str) -> dict:
     for msg in anthropic_body.get("messages", []):
         role = msg["role"]
         content = msg.get("content", "")
-        # Anthropic content 可以是字符串或 content block 数组
+
         if isinstance(content, list):
-            texts = []
-            for block in content:
-                if block.get("type") == "text":
-                    texts.append(block["text"])
-                elif block.get("type") == "image":
-                    texts.append("[image]")
-                elif block.get("type") == "tool_use":
-                    texts.append(json.dumps(block))
-                elif block.get("type") == "tool_result":
-                    texts.append(json.dumps(block))
-            content = "\n".join(texts)
-        openai_messages.append({"role": role, "content": content})
+            # content block 数组 — 可能有 tool_use, tool_result
+            has_tool_blocks = any(b.get("type") in ("tool_use", "tool_result") for b in content)
+
+            if has_tool_blocks:
+                # 拆成 OpenAI 格式：tool_use → assistant + tool_calls, tool_result → tool role
+                texts = []
+                tool_calls = []
+                for block in content:
+                    bt = block.get("type")
+                    if bt == "text":
+                        texts.append(block["text"])
+                    elif bt == "tool_use":
+                        tc = {
+                            "id": block.get("id", ""),
+                            "type": "function",
+                            "function": {
+                                "name": block.get("name", ""),
+                                "arguments": json.dumps(block.get("input", {})),
+                            },
+                        }
+                        tool_calls.append(tc)
+                    elif bt == "tool_result":
+                        tool_result_content = block.get("content", "")
+                        if isinstance(tool_result_content, list):
+                            tool_result_content = "\n".join(
+                                b.get("text", "") for b in tool_result_content
+                                if isinstance(b, dict) and b.get("type") == "text"
+                            )
+                        openai_messages.append({
+                            "role": "tool",
+                            "content": tool_result_content,
+                            "tool_call_id": block.get("tool_use_id", ""),
+                        })
+                    elif bt == "image":
+                        texts.append("[image]")
+
+                if tool_calls:
+                    assistant_msg = {"role": "assistant", "content": "\n".join(texts) if texts else None}
+                    assistant_msg["tool_calls"] = tool_calls
+                    openai_messages.append(assistant_msg)
+                elif texts:
+                    openai_messages.append({"role": role, "content": "\n".join(texts)})
+                else:
+                    openai_messages.append({"role": role, "content": ""})
+            else:
+                texts = []
+                for block in content:
+                    if block.get("type") == "text":
+                        texts.append(block["text"])
+                    elif block.get("type") == "image":
+                        texts.append("[image]")
+                openai_messages.append({"role": role, "content": "\n".join(texts)})
+        else:
+            openai_messages.append({"role": role, "content": content})
 
     # system 提示在 Anthropic 中是顶层字段
     system = anthropic_body.get("system")
@@ -520,12 +562,30 @@ def _anthropic_to_openai(anthropic_body: dict, model_name: str) -> dict:
             system = "\n".join(b.get("text", "") for b in system if b.get("type") == "text")
         openai_messages.insert(0, {"role": "system", "content": system})
 
+    # tools: Anthropic tools → OpenAI functions
+    tools = anthropic_body.get("tools")
+    oai_tools = None
+    if tools:
+        oai_tools = []
+        for t in tools:
+            oai_tools.append({
+                "type": "function",
+                "function": {
+                    "name": t.get("name", ""),
+                    "description": t.get("description", ""),
+                    "parameters": t.get("input_schema", {}),
+                },
+            })
+
     oai = {
         "model": model_name,
         "messages": openai_messages,
         "max_tokens": anthropic_body.get("max_tokens", 4096),
         "stream": anthropic_body.get("stream", False),
     }
+
+    if oai_tools:
+        oai["tools"] = oai_tools
 
     # 可选参数
     if "temperature" in anthropic_body:
