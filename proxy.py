@@ -387,6 +387,8 @@ def create_app(config: dict) -> FastAPI:
                     first = True
                     content_text = ""
                     stop_reason = None
+                    text_block_started = False
+                    tool_blocks_started = {}
 
                     # message_start
                     start_msg = {
@@ -395,7 +397,6 @@ def create_app(config: dict) -> FastAPI:
                         "stop_reason": None, "stop_sequence": None, "usage": None,
                     }
                     yield f"event: message_start\ndata: {json.dumps({'type':'message_start','message':start_msg})}\n\n"
-                    yield f"event: content_block_start\ndata: {json.dumps({'type':'content_block_start','index':0,'content_block':{'type':'text','text':''}})}\n\n"
 
                     async with httpx.AsyncClient(timeout=120.0) as cli:
                         try:
@@ -427,19 +428,23 @@ def create_app(config: dict) -> FastAPI:
                                     frag = delta.get("content", "")
                                     if frag:
                                         content_text += frag
+                                    if not text_block_started:
+                                        text_block_started = True
+                                        yield "event: content_block_start\ndata: " + json.dumps({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}) + "\n\n"
                                         yield f"event: content_block_delta\ndata: {json.dumps({'type':'content_block_delta','index':0,'delta':{'type':'text_delta','text':frag}})}\n\n"
 
-                                    # tool_calls 翻译
+                                    # tool_calls
                                     tool_calls = delta.get("tool_calls")
                                     if tool_calls:
                                         for tc in tool_calls:
                                             fn = tc.get("function", {})
-                                            idx = tc.get("index", 0)
-                                            if "name" in fn and fn["name"]:
-                                                yield f"event: content_block_start\ndata: {json.dumps({'type':'content_block_start','index':idx+1,'content_block':{'type':'tool_use','id':tc.get('id',''),'name':fn['name'],'input':{}}})}\n\n"
-                                            if "arguments" in fn and fn["arguments"]:
-                                                yield f"event: content_block_delta\ndata: {json.dumps({'type':'content_block_delta','index':idx+1,'delta':{'type':'input_json_delta','partial_json':fn['arguments']}})}\n\n"
-
+                                            idx = tc.get("index", 0) + 1
+                                            if idx not in tool_blocks_started:
+                                                tool_blocks_started[idx] = True
+                                                yield "event: content_block_start\ndata: " + json.dumps({"type":"content_block_start","index":idx,"content_block":{"type":"tool_use","id":tc.get("id",""),"name":fn.get("name",""),"input":{}}}) + "\n\n"
+                                            if fn.get("arguments"):
+                                                yield "event: content_block_delta\ndata: " + json.dumps({"type":"content_block_delta","index":idx,"delta":{"type":"input_json_delta","partial_json":fn["arguments"]}}) + "\n\n"
+                                        continue
                                     fr = choices[0].get("finish_reason")
                                     if fr:
                                         stop_reason = fr
@@ -448,8 +453,11 @@ def create_app(config: dict) -> FastAPI:
                             yield f"event: error\ndata: {json.dumps({'type':'error','error':{'message':str(e)}})}\n\n"
                             return
 
-                    # content_block_stop + message_delta + message_stop
-                    yield f"event: content_block_stop\ndata: {json.dumps({'type':'content_block_stop','index':0})}\n\n"
+                    # close all blocks
+                    if text_block_started:
+                        yield "event: content_block_stop\ndata: " + json.dumps({"type":"content_block_stop","index":0}) + "\n\n"
+                    for idx in sorted(tool_blocks_started):
+                        yield "event: content_block_stop\ndata: " + json.dumps({"type":"content_block_stop","index":idx}) + "\n\n"
 
                     sr_map = {"stop": "end_turn", "length": "max_tokens", "tool_calls": "tool_use"}
                     sr = sr_map.get(stop_reason, stop_reason)
