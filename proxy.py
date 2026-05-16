@@ -382,86 +382,102 @@ def create_app(config: dict) -> FastAPI:
                 }
 
                 async def anthropic_stream():
-                    msg_id = f"msg_{os.urandom(8).hex()}"
                     nonlocal attempt, model_name
-                    first = True
-                    content_text = ""
-                    stop_reason = None
-                    text_block_started = False
-                    tool_blocks_started = {}
+                    max_retries = settings.get("max_retries", 3)
 
-                    # message_start
-                    start_msg = {
-                        "id": msg_id, "type": "message", "role": "assistant",
-                        "content": [], "model": model_name,
-                        "stop_reason": None, "stop_sequence": None, "usage": None,
-                    }
-                    yield f"event: message_start\ndata: {json.dumps({'type':'message_start','message':start_msg})}\n\n"
-
-                    async with httpx.AsyncClient(timeout=120.0) as cli:
-                        try:
-                            async with cli.stream("POST", url, json=ms_request, headers=headers) as resp:
-                                if resp.status_code == 429:
-                                    manager.handle_429(model_name)
-                                    yield f"event: error\ndata: {json.dumps({'type':'error','error':{'type':'rate_limit_error'}})}\n\n"
-                                    return
-                                if resp.status_code != 200:
-                                    yield f"event: error\ndata: {json.dumps({'type':'error','error':{'type':'upstream_error'}})}\n\n"
-                                    return
-
-                                manager.record_usage(model_name)
-                                async for line in resp.aiter_lines():
-                                    if not line.startswith("data: "):
-                                        continue
-                                    payload = line[6:].strip()
-                                    if payload == "[DONE]":
-                                        continue
-                                    try:
-                                        chunk = json.loads(payload)
-                                    except json.JSONDecodeError:
-                                        continue
-
-                                    choices = chunk.get("choices", [])
-                                    if not choices:
-                                        continue
-                                    delta = choices[0].get("delta", {})
-                                    frag = delta.get("content", "") or delta.get("reasoning_content", "") or ""
-                                    if frag:
-                                        if not text_block_started:
-                                            text_block_started = True
-                                            yield "event: content_block_start\ndata: " + json.dumps({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}) + "\n\n"
-                                        content_text += frag
-                                        yield "event: content_block_delta\ndata: " + json.dumps({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":frag}}) + "\n\n"
-                                    # tool_calls
-                                    tool_calls = delta.get("tool_calls")
-                                    if tool_calls:
-                                        for tc in tool_calls:
-                                            fn = tc.get("function", {})
-                                            idx = tc.get("index", 0) + 1
-                                            if idx not in tool_blocks_started:
-                                                tool_blocks_started[idx] = True
-                                                yield "event: content_block_start\ndata: " + json.dumps({"type":"content_block_start","index":idx,"content_block":{"type":"tool_use","id":tc.get("id",""),"name":fn.get("name",""),"input":{}}}) + "\n\n"
-                                            if fn.get("arguments"):
-                                                yield "event: content_block_delta\ndata: " + json.dumps({"type":"content_block_delta","index":idx,"delta":{"type":"input_json_delta","partial_json":fn["arguments"]}}) + "\n\n"
-                                        continue
-                                    fr = choices[0].get("finish_reason")
-                                    if fr:
-                                        stop_reason = fr
-
-                        except httpx.RequestError as e:
-                            yield f"event: error\ndata: {json.dumps({'type':'error','error':{'message':str(e)}})}\n\n"
+                    for _ in range(max_retries + 1):
+                        current = manager.select_model()
+                        if current is None:
+                            yield f"event: error\ndata: {json.dumps({'type':'error','error':{'type':'rate_limit_error','message':'all models exhausted'}})}\n\n"
                             return
 
-                    # close all blocks
-                    if text_block_started:
-                        yield "event: content_block_stop\ndata: " + json.dumps({"type":"content_block_stop","index":0}) + "\n\n"
-                    for idx in sorted(tool_blocks_started):
-                        yield "event: content_block_stop\ndata: " + json.dumps({"type":"content_block_stop","index":idx}) + "\n\n"
+                        msg_id = f"msg_{os.urandom(8).hex()}"
+                        content_text = ""
+                        stop_reason = None
+                        text_block_started = False
+                        tool_blocks_started = {}
 
-                    sr_map = {"stop": "end_turn", "length": "max_tokens", "tool_calls": "tool_use"}
-                    sr = sr_map.get(stop_reason, stop_reason)
-                    yield f"event: message_delta\ndata: {json.dumps({'type':'message_delta','delta':{'stop_reason':sr,'stop_sequence':None},'usage':{'input_tokens':0,'output_tokens':0}})}\n\n"
-                    yield f"event: message_stop\ndata: {json.dumps({'type':'message_stop'})}\n\n"
+                        start_msg = {
+                            "id": msg_id, "type": "message", "role": "assistant",
+                            "content": [], "model": current,
+                            "stop_reason": None, "stop_sequence": None, "usage": None,
+                        }
+                        yield f"event: message_start\ndata: {json.dumps({'type':'message_start','message':start_msg})}\n\n"
+
+                        req = translate_request(request_body, current)
+                        hdrs = {
+                            "Authorization": f"Bearer {upstream_cfg['api_key']}",
+                            "Content-Type": "application/json",
+                            "Accept": "application/json",
+                        }
+
+                        async with httpx.AsyncClient(timeout=120.0) as cli:
+                            try:
+                                async with cli.stream("POST", url, json=req, headers=hdrs) as resp:
+                                    if resp.status_code == 429:
+                                        manager.handle_429(current)
+                                        yield f"event: error\ndata: {json.dumps({'type':'error','error':{'type':'rate_limit_error'}})}\n\n"
+                                        continue
+                                    if resp.status_code != 200:
+                                        yield f"event: error\ndata: {json.dumps({'type':'error','error':{'type':'upstream_error'}})}\n\n"
+                                        return
+
+                                    manager.record_usage(current)
+                                    async for line in resp.aiter_lines():
+                                        if not line.startswith("data: "):
+                                            continue
+                                        payload = line[6:].strip()
+                                        if payload == "[DONE]":
+                                            continue
+                                        try:
+                                            chunk = json.loads(payload)
+                                        except json.JSONDecodeError:
+                                            continue
+
+                                        choices = chunk.get("choices", [])
+                                        if not choices:
+                                            continue
+                                        delta = choices[0].get("delta", {})
+                                        frag = delta.get("content", "")
+                                        if frag:
+                                            if not text_block_started:
+                                                text_block_started = True
+                                                yield "event: content_block_start\ndata: " + json.dumps({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}) + "\n\n"
+                                            content_text += frag
+                                            yield "event: content_block_delta\ndata: " + json.dumps({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":frag}}) + "\n\n"
+
+                                        tool_calls = delta.get("tool_calls")
+                                        if tool_calls:
+                                            for tc in tool_calls:
+                                                fn = tc.get("function", {})
+                                                idx = tc.get("index", 0) + 1
+                                                if idx not in tool_blocks_started:
+                                                    tool_blocks_started[idx] = True
+                                                    yield "event: content_block_start\ndata: " + json.dumps({"type":"content_block_start","index":idx,"content_block":{"type":"tool_use","id":tc.get("id",""),"name":fn.get("name",""),"input":{}}}) + "\n\n"
+                                                if fn.get("arguments"):
+                                                    yield "event: content_block_delta\ndata: " + json.dumps({"type":"content_block_delta","index":idx,"delta":{"type":"input_json_delta","partial_json":fn["arguments"]}}) + "\n\n"
+                                            continue
+
+                                        fr = choices[0].get("finish_reason")
+                                        if fr:
+                                            stop_reason = fr
+
+                            except httpx.RequestError as e:
+                                yield f"event: error\ndata: {json.dumps({'type':'error','error':{'message':str(e)}})}\n\n"
+                                return
+
+                        if text_block_started:
+                            yield "event: content_block_stop\ndata: " + json.dumps({"type":"content_block_stop","index":0}) + "\n\n"
+                        for idx in sorted(tool_blocks_started):
+                            yield "event: content_block_stop\ndata: " + json.dumps({"type":"content_block_stop","index":idx}) + "\n\n"
+
+                        sr_map = {"stop": "end_turn", "length": "max_tokens", "tool_calls": "tool_use"}
+                        sr = sr_map.get(stop_reason, stop_reason)
+                        yield f"event: message_delta\ndata: {json.dumps({'type':'message_delta','delta':{'stop_reason':sr,'stop_sequence':None},'usage':{'input_tokens':0,'output_tokens':0}})}\n\n"
+                        yield f"event: message_stop\ndata: {json.dumps({'type':'message_stop'})}\n\n"
+                        return  # 成功结束
+
+                    yield f"event: error\ndata: {json.dumps({'type':'error','error':{'type':'rate_limit_error','message':'retries exhausted'}})}\n\n"
 
                 return StreamingResponse(anthropic_stream(), media_type="text/event-stream", headers=anthropic_headers)
 

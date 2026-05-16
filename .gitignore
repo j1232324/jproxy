@@ -3,3 +3,4 @@ __pycache__/
 .model_quota_state.json
 .model_review
 .env
+config.yaml

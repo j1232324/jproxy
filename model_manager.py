@@ -195,8 +195,8 @@ class ModelManager:
     def _get_model_limit(self, name: str) -> int:
         for m in self.models:
             if m["name"] == name:
-                return m.get("daily_limit", 2000)
-        return 2000
+                return m.get("daily_limit", 0)
+        return 0
 
     def _mark_daily_exhausted(self, model_name: str):
         """将模型标记为今日配额已耗尽。"""
