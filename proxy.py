@@ -309,7 +309,7 @@ def create_app(config: dict) -> FastAPI:
             if model_name is None:
                 return _all_exhausted_response(manager)
 
-            # 转换请求格式 (其实就是替换 model 字段)
+            print(f"  ▶ 使用模型: {model_name}")
             ms_request = translate_request(body, model_name)
 
             headers = {
@@ -359,6 +359,7 @@ def create_app(config: dict) -> FastAPI:
             if model_name is None:
                 return _all_exhausted_response(manager)
 
+            print(f"  ▶ 使用模型: {model_name}")
             ms_request = _anthropic_to_openai(body, model_name)
             headers = {
                 "Authorization": f"Bearer {upstream_cfg['api_key']}",
@@ -382,11 +383,12 @@ def create_app(config: dict) -> FastAPI:
                 }
 
                 async def anthropic_stream():
-                    nonlocal attempt, model_name
+                    nonlocal model_name
                     max_retries = settings.get("max_retries", 3)
 
                     for _ in range(max_retries + 1):
                         current = manager.select_model()
+                        print(f"  ▶ 使用模型: {current}")
                         if current is None:
                             yield f"event: error\ndata: {json.dumps({'type':'error','error':{'type':'rate_limit_error','message':'all models exhausted'}})}\n\n"
                             return
@@ -404,7 +406,7 @@ def create_app(config: dict) -> FastAPI:
                         }
                         yield f"event: message_start\ndata: {json.dumps({'type':'message_start','message':start_msg})}\n\n"
 
-                        req = translate_request(request_body, current)
+                        oai_body = _anthropic_to_openai(body, current)
                         hdrs = {
                             "Authorization": f"Bearer {upstream_cfg['api_key']}",
                             "Content-Type": "application/json",
@@ -413,7 +415,7 @@ def create_app(config: dict) -> FastAPI:
 
                         async with httpx.AsyncClient(timeout=120.0) as cli:
                             try:
-                                async with cli.stream("POST", url, json=req, headers=hdrs) as resp:
+                                async with cli.stream("POST", url, json=oai_body, headers=hdrs) as resp:
                                     if resp.status_code == 429:
                                         manager.handle_429(current)
                                         yield f"event: error\ndata: {json.dumps({'type':'error','error':{'type':'rate_limit_error'}})}\n\n"
@@ -776,6 +778,7 @@ async def _handle_streaming(
         for attempt in range(max_retries + 1):
             # 每次重试重新选择模型（因为前面的可能已被标记耗尽）
             current_model = manager.select_model()
+            print(f"  ▶ 使用模型: {current_model}")
             if current_model is None:
                 yield _sse_error("所有模型配额已耗尽")
                 yield "data: [DONE]\n\n"
