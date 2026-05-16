@@ -425,14 +425,13 @@ def create_app(config: dict) -> FastAPI:
                                     if not choices:
                                         continue
                                     delta = choices[0].get("delta", {})
-                                    frag = delta.get("content", "")
+                                    frag = delta.get("content", "") or delta.get("reasoning_content", "") or ""
                                     if frag:
+                                        if not text_block_started:
+                                            text_block_started = True
+                                            yield "event: content_block_start\ndata: " + json.dumps({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}) + "\n\n"
                                         content_text += frag
-                                    if not text_block_started:
-                                        text_block_started = True
-                                        yield "event: content_block_start\ndata: " + json.dumps({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}) + "\n\n"
-                                        yield f"event: content_block_delta\ndata: {json.dumps({'type':'content_block_delta','index':0,'delta':{'type':'text_delta','text':frag}})}\n\n"
-
+                                        yield "event: content_block_delta\ndata: " + json.dumps({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":frag}}) + "\n\n"
                                     # tool_calls
                                     tool_calls = delta.get("tool_calls")
                                     if tool_calls:
