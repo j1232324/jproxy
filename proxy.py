@@ -401,7 +401,7 @@ def create_app(config: dict) -> FastAPI:
                         try:
                             async with cli.stream("POST", url, json=ms_request, headers=headers) as resp:
                                 if resp.status_code == 429:
-                                    manager.mark_exhausted(model_name)
+                                    manager.handle_429(model_name)
                                     yield f"event: error\ndata: {json.dumps({'type':'error','error':{'type':'rate_limit_error'}})}\n\n"
                                     return
                                 if resp.status_code != 200:
@@ -428,6 +428,17 @@ def create_app(config: dict) -> FastAPI:
                                     if frag:
                                         content_text += frag
                                         yield f"event: content_block_delta\ndata: {json.dumps({'type':'content_block_delta','index':0,'delta':{'type':'text_delta','text':frag}})}\n\n"
+
+                                    # tool_calls 翻译
+                                    tool_calls = delta.get("tool_calls")
+                                    if tool_calls:
+                                        for tc in tool_calls:
+                                            fn = tc.get("function", {})
+                                            idx = tc.get("index", 0)
+                                            if "name" in fn and fn["name"]:
+                                                yield f"event: content_block_start\ndata: {json.dumps({'type':'content_block_start','index':idx+1,'content_block':{'type':'tool_use','id':tc.get('id',''),'name':fn['name'],'input':{}}})}\n\n"
+                                            if "arguments" in fn and fn["arguments"]:
+                                                yield f"event: content_block_delta\ndata: {json.dumps({'type':'content_block_delta','index':idx+1,'delta':{'type':'input_json_delta','partial_json':fn['arguments']}})}\n\n"
 
                                     fr = choices[0].get("finish_reason")
                                     if fr:
@@ -457,7 +468,7 @@ def create_app(config: dict) -> FastAPI:
                 try:
                     resp = await client.post(url, json=ms_request, headers=headers)
                     if resp.status_code == 429:
-                        manager.mark_exhausted(model_name)
+                        manager.handle_429(model_name)
                         continue
                     if resp.status_code != 200:
                         return JSONResponse(status_code=resp.status_code, content={"error": _extract_error(resp)})
@@ -621,7 +632,7 @@ async def _handle_non_streaming(
 
             # 配额耗尽 — 标记后返回 None 触发重试
             if response.status_code == 429:
-                manager.mark_exhausted(model_name)
+                manager.handle_429(model_name)
                 print(f"  [↻] {model_name} 配额耗尽，尝试下一个模型...")
                 return None
 
@@ -697,7 +708,7 @@ async def _handle_streaming(
                     ) as response:
                         # 配额耗尽 — 标记后重试
                         if response.status_code == 429:
-                            manager.mark_exhausted(current_model)
+                            manager.handle_429(current_model)
                             print(f"  [↻] {current_model} 配额耗尽，尝试下一个...")
                             continue
 
