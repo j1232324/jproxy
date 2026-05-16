@@ -367,7 +367,85 @@ def create_app(config: dict) -> FastAPI:
             }
 
             if stream:
-                return await _handle_streaming(ms_request, headers, model_name, upstream_cfg["base_url"], manager)
+                # 流式：调上游拿 OpenAI SSE，转成 Anthropic SSE
+                if upstream_cfg["base_url"].endswith("/v1"):
+                    url = f"{upstream_cfg['base_url']}/chat/completions"
+                else:
+                    url = f"{upstream_cfg['base_url']}/v1/chat/completions"
+
+                # 构建 Anthropic SSE 响应头
+                anthropic_headers = {
+                    "Content-Type": "text/event-stream",
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                    "X-Accel-Buffering": "no",
+                }
+
+                async def anthropic_stream():
+                    msg_id = f"msg_{os.urandom(8).hex()}"
+                    nonlocal attempt, model_name
+                    first = True
+                    content_text = ""
+                    stop_reason = None
+
+                    # message_start
+                    start_msg = {
+                        "id": msg_id, "type": "message", "role": "assistant",
+                        "content": [], "model": model_name,
+                        "stop_reason": None, "stop_sequence": None, "usage": None,
+                    }
+                    yield f"event: message_start\ndata: {json.dumps({'type':'message_start','message':start_msg})}\n\n"
+                    yield f"event: content_block_start\ndata: {json.dumps({'type':'content_block_start','index':0,'content_block':{'type':'text','text':''}})}\n\n"
+
+                    async with httpx.AsyncClient(timeout=120.0) as cli:
+                        try:
+                            async with cli.stream("POST", url, json=ms_request, headers=headers) as resp:
+                                if resp.status_code == 429:
+                                    manager.mark_exhausted(model_name)
+                                    yield f"event: error\ndata: {json.dumps({'type':'error','error':{'type':'rate_limit_error'}})}\n\n"
+                                    return
+                                if resp.status_code != 200:
+                                    yield f"event: error\ndata: {json.dumps({'type':'error','error':{'type':'upstream_error'}})}\n\n"
+                                    return
+
+                                manager.record_usage(model_name)
+                                async for line in resp.aiter_lines():
+                                    if not line.startswith("data: "):
+                                        continue
+                                    payload = line[6:].strip()
+                                    if payload == "[DONE]":
+                                        continue
+                                    try:
+                                        chunk = json.loads(payload)
+                                    except json.JSONDecodeError:
+                                        continue
+
+                                    choices = chunk.get("choices", [])
+                                    if not choices:
+                                        continue
+                                    delta = choices[0].get("delta", {})
+                                    frag = delta.get("content", "")
+                                    if frag:
+                                        content_text += frag
+                                        yield f"event: content_block_delta\ndata: {json.dumps({'type':'content_block_delta','index':0,'delta':{'type':'text_delta','text':frag}})}\n\n"
+
+                                    fr = choices[0].get("finish_reason")
+                                    if fr:
+                                        stop_reason = fr
+
+                        except httpx.RequestError as e:
+                            yield f"event: error\ndata: {json.dumps({'type':'error','error':{'message':str(e)}})}\n\n"
+                            return
+
+                    # content_block_stop + message_delta + message_stop
+                    yield f"event: content_block_stop\ndata: {json.dumps({'type':'content_block_stop','index':0})}\n\n"
+
+                    sr_map = {"stop": "end_turn", "length": "max_tokens", "tool_calls": "tool_use"}
+                    sr = sr_map.get(stop_reason, stop_reason)
+                    yield f"event: message_delta\ndata: {json.dumps({'type':'message_delta','delta':{'stop_reason':sr,'stop_sequence':None},'usage':{'input_tokens':0,'output_tokens':0}})}\n\n"
+                    yield f"event: message_stop\ndata: {json.dumps({'type':'message_stop'})}\n\n"
+
+                return StreamingResponse(anthropic_stream(), media_type="text/event-stream", headers=anthropic_headers)
 
             # 直接调上游，不走 _handle_non_streaming（避免 JSONResponse 序列化再反序列化）
             if upstream_cfg["base_url"].endswith("/v1"):
