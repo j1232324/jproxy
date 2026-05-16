@@ -1,28 +1,25 @@
-# ============================================================
-# jproxy 配置文件
-# ============================================================
-
-proxy:
-  host: "0.0.0.0"
-  port: 8000
-  api_key: "sk-your-proxy-key"
-
-upstream:
-  # 上游 API 地址（OpenAI 兼容格式）
-  # 例如: https://api.openai.com/v1
-  base_url: "https://api.openai.com/v1"
-
-  # 上游 API Key
-  api_key: ""
-
-# 模型列表 — 按优先级排序，数值越小优先级越高
-# 最高优先级的先用，遇到 429 自动降级到下一个
 models:
-  - name: "Qwen/Qwen2.5-72B-Instruct"
-    priority: 1
-  - name: "Qwen/Qwen2.5-32B-Instruct"
-    priority: 2
-
+- name: deepseek-ai/DeepSeek-V4-Pro
+  priority: 1
+- name: deepseek-ai/DeepSeek-V4-Flash
+  priority: 2
+- name: moonshotai/Kimi-K2.6
+  priority: 3
+- name: ZhipuAI/GLM-5.1
+  priority: 4
+- name: Tencent-Hunyuan/Hy3-preview
+  priority: 5
+- name: MiniMax/MiniMax-M2.7
+  priority: 6
+- name: ZhipuAI/GLM-5
+  priority: 7
+proxy:
+  api_key: '1234'
+  host: 0.0.0.0
+  port: 8000
 settings:
   max_retries: 3
   model_review_interval_days: 30
+upstream:
+  api_key: ms-77c02683-cac9-4ca2-bc0d-2cd183a20a93
+  base_url: https://api-inference.modelscope.cn/v1

@@ -343,10 +343,181 @@ def create_app(config: dict) -> FastAPI:
             headers={"Retry-After": "3600"},
         )
 
-    # ── 用纯 ASGI 中间件包裹 app（不经过 @app.middleware，避免 BaseHTTPMiddleware 兼容问题）──
+    # ── Anthropic Messages 端点 ──
+    @app.post("/v1/messages")
+    async def messages(raw_request: Request):
+        try:
+            body = await raw_request.json()
+        except json.JSONDecodeError:
+            return JSONResponse(status_code=400, content={"error": {"message":"invalid json"}})
+
+        stream = body.get("stream", False)
+        max_retries = settings.get("max_retries", 3)
+
+        for attempt in range(max_retries + 1):
+            model_name = manager.select_model()
+            if model_name is None:
+                return _all_exhausted_response(manager)
+
+            ms_request = _anthropic_to_openai(body, model_name)
+            headers = {
+                "Authorization": f"Bearer {upstream_cfg['api_key']}",
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+            }
+
+            if stream:
+                return await _handle_streaming(ms_request, headers, model_name, upstream_cfg["base_url"], manager)
+
+            # 直接调上游，不走 _handle_non_streaming（避免 JSONResponse 序列化再反序列化）
+            if upstream_cfg["base_url"].endswith("/v1"):
+                url = f"{upstream_cfg['base_url']}/chat/completions"
+            else:
+                url = f"{upstream_cfg['base_url']}/v1/chat/completions"
+
+            async with httpx.AsyncClient(timeout=120.0) as client:
+                try:
+                    resp = await client.post(url, json=ms_request, headers=headers)
+                    if resp.status_code == 429:
+                        manager.mark_exhausted(model_name)
+                        continue
+                    if resp.status_code != 200:
+                        return JSONResponse(status_code=resp.status_code, content={"error": _extract_error(resp)})
+                    manager.record_usage(model_name)
+                    oai_data = resp.json()
+                    anthro = _openai_to_anthropic(oai_data, ms_request, model_name)
+                    return JSONResponse(content=anthro)
+                except httpx.TimeoutException:
+                    return JSONResponse(status_code=504, content={"error":{"message":"timeout"}})
+                except httpx.RequestError as e:
+                    return JSONResponse(status_code=502, content={"error":{"message":str(e)}})
+
+        return JSONResponse(status_code=429, content={"error": {"message":"all models exhausted"}})
+
+    # ── 用纯 ASGI 中间件包裹 app──
     AuthMiddleware = _make_auth_middleware(proxy_cfg["api_key"])
     app = AuthMiddleware(app)
     return app
+
+
+# ─── Anthropic / OpenAI 格式互转 ─────────────────────────
+
+
+def _anthropic_to_openai(anthropic_body: dict, model_name: str) -> dict:
+    """将 Anthropic Messages 请求转为 OpenAI Chat Completions 请求。"""
+    openai_messages = []
+    for msg in anthropic_body.get("messages", []):
+        role = msg["role"]
+        content = msg.get("content", "")
+        # Anthropic content 可以是字符串或 content block 数组
+        if isinstance(content, list):
+            texts = []
+            for block in content:
+                if block.get("type") == "text":
+                    texts.append(block["text"])
+                elif block.get("type") == "image":
+                    texts.append("[image]")
+                elif block.get("type") == "tool_use":
+                    texts.append(json.dumps(block))
+                elif block.get("type") == "tool_result":
+                    texts.append(json.dumps(block))
+            content = "\n".join(texts)
+        openai_messages.append({"role": role, "content": content})
+
+    # system 提示在 Anthropic 中是顶层字段
+    system = anthropic_body.get("system")
+    if system:
+        if isinstance(system, list):
+            system = "\n".join(b.get("text", "") for b in system if b.get("type") == "text")
+        openai_messages.insert(0, {"role": "system", "content": system})
+
+    oai = {
+        "model": model_name,
+        "messages": openai_messages,
+        "max_tokens": anthropic_body.get("max_tokens", 4096),
+        "stream": anthropic_body.get("stream", False),
+    }
+
+    # 可选参数
+    if "temperature" in anthropic_body:
+        oai["temperature"] = anthropic_body["temperature"]
+    if "top_p" in anthropic_body:
+        oai["top_p"] = anthropic_body["top_p"]
+    if "stop_sequences" in anthropic_body:
+        oai["stop"] = anthropic_body["stop_sequences"]
+
+    return oai
+
+
+def _openai_to_anthropic(oai_body: dict, request_body: dict, model_name: str) -> dict:
+    """将 OpenAI Chat Completions 响应转为 Anthropic Messages 格式。"""
+    choices = oai_body.get("choices", [])
+    if not choices:
+        return {
+            "id": f"msg_{os.urandom(8).hex()}",
+            "type": "message",
+            "role": "assistant",
+            "content": [],
+            "model": model_name,
+            "stop_reason": None,
+            "stop_sequence": None,
+            "usage": {"input_tokens": 0, "output_tokens": 0},
+        }
+
+    choice = choices[0]
+    msg = choice.get("message", choice.get("delta", {}))
+    content_text = msg.get("content", "") or ""
+    finish_reason = choice.get("finish_reason")
+
+    # 映射 finish_reason
+    stop_reason_map = {
+        "stop": "end_turn",
+        "length": "max_tokens",
+        "tool_calls": "tool_use",
+        "content_filter": "content_filter",
+    }
+    stop_reason = stop_reason_map.get(finish_reason, finish_reason)
+
+    # usage
+    usage = oai_body.get("usage", {})
+
+    content_blocks = []
+    if content_text:
+        content_blocks.append({"type": "text", "text": content_text})
+
+    # tool_calls → tool_use
+    tool_calls = msg.get("tool_calls")
+    if tool_calls:
+        for tc in tool_calls:
+            content_blocks.append({
+                "type": "tool_use",
+                "id": tc.get("id", ""),
+                "name": tc.get("function", {}).get("name", ""),
+                "input": json.loads(tc.get("function", {}).get("arguments", "{}")),
+            })
+
+    if not content_blocks:
+        content_blocks.append({"type": "text", "text": ""})
+
+    return {
+        "id": f"msg_{os.urandom(8).hex()}",
+        "type": "message",
+        "role": "assistant",
+        "content": content_blocks,
+        "model": model_name,
+        "stop_reason": stop_reason,
+        "stop_sequence": None,
+        "usage": {
+            "input_tokens": usage.get("prompt_tokens", 0),
+            "output_tokens": usage.get("completion_tokens", 0),
+        },
+    }
+
+
+async def _wrap_anthropic_stream(streaming_response, request_body, model_name):
+    """将 OpenAI SSE 流包装成 Anthropic SSE 流。"""
+    # 简化实现：直接透传内部错误，streaming 非流式回退
+    return streaming_response
 
 
 # ─── 请求处理函数 ────────────────────────────────────────
