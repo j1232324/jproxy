@@ -343,6 +343,25 @@ def create_app(config: dict) -> FastAPI:
             headers={"Retry-After": "3600"},
         )
 
+    @app.post("/v1/messages/count_tokens")
+    async def count_tokens(raw_request: Request):
+        try:
+            body = await raw_request.json()
+        except json.JSONDecodeError:
+            return JSONResponse(status_code=400, content={"error": {"message":"invalid json"}})
+
+        # 粗略估算：从请求中数 token
+        total = 0
+        for msg in body.get("messages", []):
+            c = msg.get("content", "")
+            if isinstance(c, str):
+                total += len(c) // 2 + 10
+            elif isinstance(c, list):
+                for b in c:
+                    if isinstance(b, dict):
+                        total += len(b.get("text", "")) // 2 + 10
+        return JSONResponse(content={"input_tokens": max(total, 1)})
+
     # ── Anthropic Messages 端点 ──
     @app.post("/v1/messages")
     async def messages(raw_request: Request):
