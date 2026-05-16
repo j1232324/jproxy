@@ -199,6 +199,62 @@ def review_models_interactive(config_path: str):
 # ─── FastAPI 应用 ─────────────────────────────────────────
 
 
+def _make_auth_middleware(api_key: str):
+    """创建认证中间件的工厂。返回的中间件在 ASGI 层工作，不依赖 Starlette BaseHTTPMiddleware。"""
+    public_paths = {"/health", "/", "/docs", "/openapi.json"}
+
+    class AuthMiddleware:
+        def __init__(self, app):
+            self.app = app
+
+        async def __call__(self, scope, receive, send):
+            if scope["type"] != "http":
+                await self.app(scope, receive, send)
+                return
+
+            path = scope.get("path", "")
+            if path in public_paths:
+                await self.app(scope, receive, send)
+                return
+
+            # 解析 headers 中的 Authorization
+            raw_headers = scope.get("headers", [])
+            auth_value = ""
+            for k, v in raw_headers:
+                if k.lower() == b"authorization":
+                    auth_value = v.decode("utf-8", errors="replace")
+                    break
+
+            expected = f"Bearer {api_key}"
+            if auth_value != expected:
+                body = json.dumps({
+                    "error": {
+                        "message": "无效的 API Key。请使用 Authorization: Bearer <你的代理 Key>",
+                        "type": "authentication_error",
+                        "code": "invalid_api_key",
+                    }
+                },
+                ensure_ascii=False).encode("utf-8")
+                headers_out = [
+                    (b"content-type", b"application/json"),
+                    (b"content-length", str(len(body)).encode()),
+                ]
+                await send({
+                    "type": "http.response.start",
+                    "status": 401,
+                    "headers": headers_out,
+                })
+                await send({
+                    "type": "http.response.body",
+                    "body": body,
+                })
+                return
+
+            await self.app(scope, receive, send)
+
+    return AuthMiddleware
+
+
 def create_app(config: dict) -> FastAPI:
     """创建 FastAPI 应用实例。"""
     app = FastAPI(title="jproxy", version="1.0.0")
@@ -206,32 +262,6 @@ def create_app(config: dict) -> FastAPI:
     upstream_cfg = config["upstream"]
     proxy_cfg = config["proxy"]
     settings = config["settings"]
-
-    # ── 认证中间件 ──
-    @app.middleware("http")
-    async def auth_middleware(request: Request, call_next):
-        # 以下路径不需要认证
-        public_paths = {"/health", "/", "/docs", "/openapi.json"}
-        if request.url.path in public_paths:
-            return await call_next(request)
-
-        auth = request.headers.get("Authorization", "")
-        expected = f"Bearer {proxy_cfg['api_key']}"
-
-        if auth != expected:
-            return JSONResponse(
-                status_code=401,
-                content={
-                    "error": {
-                        "message": "无效的 API Key。请使用 Authorization: Bearer <你的代理 Key>",
-                        "type": "authentication_error",
-                        "code": "invalid_api_key",
-                    }
-                },
-                headers={"Content-Type": "application/json"},
-            )
-
-        return await call_next(request)
 
     # ── 路由 ──
 
@@ -289,22 +319,18 @@ def create_app(config: dict) -> FastAPI:
             }
 
             if stream:
-                # 流式响应 — 交给独立的处理函数
                 return await _handle_streaming(
                     ms_request, headers, model_name,
                     upstream_cfg["base_url"], manager,
                 )
             else:
-                # 非流式响应
                 result = await _handle_non_streaming(
                     ms_request, headers, model_name,
                     upstream_cfg["base_url"], manager,
                 )
                 if result is not None:
                     return result
-                # result 为 None 表示遇到了 429，继续下一个模型
 
-        # 所有模型都尝试过了
         return JSONResponse(
             status_code=429,
             content={
@@ -317,6 +343,9 @@ def create_app(config: dict) -> FastAPI:
             headers={"Retry-After": "3600"},
         )
 
+    # ── 用纯 ASGI 中间件包裹 app（不经过 @app.middleware，避免 BaseHTTPMiddleware 兼容问题）──
+    AuthMiddleware = _make_auth_middleware(proxy_cfg["api_key"])
+    app = AuthMiddleware(app)
     return app
 
 
@@ -331,7 +360,11 @@ async def _handle_non_streaming(
     manager: ModelManager,
 ) -> Optional[JSONResponse]:
     """处理非流式请求。遇到 429 返回 None 让上层重试。"""
-    url = f"{base_url}/v1/chat/completions"
+    # base_url 可能已包含 /v1 路径，避免重复
+    if base_url.endswith("/v1"):
+        url = f"{base_url}/chat/completions"
+    else:
+        url = f"{base_url}/v1/chat/completions"
 
     async with httpx.AsyncClient(timeout=120.0) as client:
         try:
@@ -346,6 +379,7 @@ async def _handle_non_streaming(
             # 其他错误 — 直接返回
             if response.status_code != 200:
                 error_body = _extract_error(response)
+                # 透传上游状态码，日志里能看到实际错误
                 return JSONResponse(
                     status_code=response.status_code,
                     content={"error": error_body},
@@ -388,7 +422,11 @@ async def _handle_streaming(
     - 但一旦开始流数据，如果半路 429 就无法优雅降级了
       (实际上 429 在建立连接时就会返回，不会半路出现)
     """
-    url = f"{base_url}/v1/chat/completions"
+    # base_url 可能已包含 /v1 路径，避免重复
+    if base_url.endswith("/v1"):
+        url = f"{base_url}/chat/completions"
+    else:
+        url = f"{base_url}/v1/chat/completions"
     max_retries = manager.settings.get("max_retries", 3)
 
     async def generate():
