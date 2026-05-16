@@ -406,17 +406,6 @@ def create_app(config: dict) -> FastAPI:
                                     yield f"event: error\ndata: {json.dumps({'type':'error','error':{'type':'rate_limit_error'}})}\n\n"
                                     return
                                 if resp.status_code != 200:
-                                    err_body = _extract_error(resp)
-                                    err_msg = err_body.get("message", "") if isinstance(err_body, dict) else str(err_body)
-                                    is_model_err = (
-                                        resp.status_code in (400, 404)
-                                        and ("no provider" in err_msg.lower() or "not found" in err_msg.lower() or "not support" in err_msg.lower())
-                                    )
-                                    if is_model_err:
-                                        print(f"  [↻] {model_name} 模型不支持，尝试下一个...")
-                                        manager.handle_429(model_name)
-                                        yield f"event: error\ndata: {json.dumps({'type':'error','error':{'type':'model_error'}})}\n\n"
-                                        return
                                     yield f"event: error\ndata: {json.dumps({'type':'error','error':{'type':'upstream_error'}})}\n\n"
                                     return
 
@@ -436,7 +425,7 @@ def create_app(config: dict) -> FastAPI:
                                     if not choices:
                                         continue
                                     delta = choices[0].get("delta", {})
-                                    frag = delta.get("content", "")
+                                    frag = delta.get("content", "") or delta.get("reasoning_content", "") or ""
                                     if frag:
                                         if not text_block_started:
                                             text_block_started = True
@@ -489,17 +478,7 @@ def create_app(config: dict) -> FastAPI:
                         manager.handle_429(model_name)
                         continue
                     if resp.status_code != 200:
-                        err_body = _extract_error(resp)
-                        err_msg = err_body.get("message", "") if isinstance(err_body, dict) else str(err_body)
-                        is_model_err = (
-                            resp.status_code in (400, 404)
-                            and ("no provider" in err_msg.lower() or "not found" in err_msg.lower() or "not support" in err_msg.lower())
-                        )
-                        if is_model_err:
-                            print(f"  [↻] {model_name} 模型不支持，尝试下一个...")
-                            manager.handle_429(model_name)
-                            continue
-                        return JSONResponse(status_code=resp.status_code, content={"error": err_body})
+                        return JSONResponse(status_code=resp.status_code, content={"error": _extract_error(resp)})
                     manager.record_usage(model_name)
                     oai_data = resp.json()
                     anthro = _openai_to_anthropic(oai_data, ms_request, model_name)
@@ -724,19 +703,10 @@ async def _handle_non_streaming(
                 print(f"  [↻] {model_name} 配额耗尽，尝试下一个模型...")
                 return None
 
-            # 其他错误 — 判断是否模型问题，是则跳过换下一个
+            # 其他错误 — 直接返回
             if response.status_code != 200:
                 error_body = _extract_error(response)
-                err_msg = error_body.get("message", "") if isinstance(error_body, dict) else str(error_body)
-                # 模型不支持的错误（400/404, 提示 no provider / not found 等）→ 标记跳过
-                is_model_error = (
-                    response.status_code in (400, 404)
-                    and ("no provider" in err_msg.lower() or "not found" in err_msg.lower() or "not support" in err_msg.lower())
-                )
-                if is_model_error:
-                    print(f"  [↻] {model_name} 模型不支持，尝试下一个...")
-                    manager.handle_429(model_name)
-                    return None
+                # 透传上游状态码，日志里能看到实际错误
                 return JSONResponse(
                     status_code=response.status_code,
                     content={"error": error_body},
